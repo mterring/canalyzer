@@ -138,11 +138,11 @@ fn main() -> Result<()> {
             } else if a.pinned && !b.pinned {
                 Ordering::Less
             } else {
-                a.values
+                b.values
                     .last()
                     .unwrap()
                     .ts
-                    .cmp(&b.values.last().unwrap().ts)
+                    .cmp(&a.values.last().unwrap().ts)
             }
         });
 

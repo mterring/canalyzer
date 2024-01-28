@@ -1,3 +1,6 @@
+use std::io::prelude::*;
+use std::io::BufReader;
+use std::fs::File;
 use std::{
     sync::mpsc::{channel, Receiver},
     time::{Duration, SystemTime},
@@ -22,7 +25,8 @@ impl Message {
 pub fn recv() -> Receiver<Message> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
-        let lines = std::io::stdin().lines().map(|l| l.unwrap());
+        let serial = File::open("/dev/ttyACM0").unwrap();
+        let lines = BufReader::new(serial).lines().map(|l| l.unwrap_or_default());
         for line in lines {
             if line == "sleep" {
                 std::thread::sleep(Duration::from_secs(1));
