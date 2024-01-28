@@ -1,50 +1,14 @@
 use anyhow::Result;
 use crossterm::ExecutableCommand;
-use ratatui::{prelude::*, widgets::{*, block::Position}};
+use ratatui::{
+    prelude::*,
+    widgets::{block::Position, *},
+};
 use serde::Serialize;
 use serde_with::{serde_as, TimestampMilliSeconds};
-use std::cmp::Ordering;
+use std::{cmp::Ordering, iter, time::SystemTime};
 
-mod canbus {
-    use std::sync::mpsc::{channel, Receiver};
-
-    pub struct Message {
-        pub id: String,
-        pub data: String,
-        pub ts: std::time::SystemTime,
-    }
-
-    impl Message {
-        fn new(id: String, data: String) -> Self {
-            Self {
-                id,
-                data,
-                ts: std::time::SystemTime::now(),
-            }
-        }
-    }
-
-    pub fn recv() -> Receiver<Message> {
-        let (tx, rx) = channel();
-        std::thread::spawn(move || {
-            let lines = std::io::stdin().lines().map(|l| l.unwrap());
-            for line in lines {
-                if line == "sleep" {
-                    std::thread::sleep(std::time::Duration::from_secs(5));
-                }
-                let mut words = line.split(" ");
-                if words.next() == Some("ID:") {
-                    if let Some(id) = words.next() {
-                        let data = words.nth(1).unwrap_or_default();
-                        tx.send(Message::new(id.to_string(), data.to_string()))
-                            .unwrap();
-                    }
-                }
-            }
-        });
-        rx
-    }
-}
+mod canbus;
 
 #[derive(Serialize)]
 struct Message {
@@ -55,11 +19,41 @@ struct Message {
 }
 
 #[serde_as]
-#[derive(Serialize, Default)]
+#[derive(Serialize)]
 struct Value {
     data: String,
     #[serde_as(as = "TimestampMilliSeconds")]
-    ts: std::time::SystemTime,
+    ts: SystemTime,
+}
+
+impl Value {
+    fn bg_color(&self) -> Color {
+        match self.ts.elapsed() {
+            Ok(d) if d.as_secs() < 1 => Color::Rgb(255, 155, 53),
+            Ok(d) if d.as_secs() < 2 => Color::Rgb(189, 55, 10),
+            Ok(d) if d.as_secs() < 3 => Color::Rgb(94, 0, 0),
+            _ => Color::Black,
+        }
+    }
+
+    fn diff(&self, other: Option<&Self>) -> Cell {
+        let mut diff = Line::default();
+        for i in 0..self.data.len() {
+            let c = self.data.get(i..i + 1).unwrap();
+            let color = if let Some(other) = other {
+                if other.data.get(i..i + 1) == Some(c) {
+                    Color::White
+                } else {
+                    Color::LightCyan
+                }
+            } else {
+                Color::White
+            };
+            diff.spans.push(Span::styled(c, Style::default().fg(color)))
+        }
+        diff.patch_style(Style::default().bg(self.bg_color()));
+        diff.into()
+    }
 }
 
 impl From<canbus::Message> for Value {
@@ -75,6 +69,33 @@ impl Message {
     fn merge(&mut self, other: canbus::Message) {
         self.values.push(other.into());
     }
+
+    fn as_row(&self, cols: usize) -> Row {
+        let row = Row::new(
+            iter::once(self.id.as_str().into())
+                .chain(
+                    self.values
+                        .iter()
+                        .rev()
+                        .zip(
+                            self.values
+                                .iter()
+                                .rev()
+                                .skip(1)
+                                .map(Some)
+                                .chain(iter::repeat(None)),
+                        )
+                        .map(|(a, b)| a.diff(b))
+                        .take(cols),
+                )
+                .collect::<Vec<Cell>>(),
+        );
+        if self.ignored {
+            row.dark_gray().crossed_out()
+        } else {
+            row
+        }
+    }
 }
 
 impl From<canbus::Message> for Message {
@@ -84,28 +105,6 @@ impl From<canbus::Message> for Message {
             values: vec![other.into()],
             ignored: false,
             pinned: false,
-        }
-    }
-}
-
-impl <'a> From<&'a Value> for Cell<'a> {
-    fn from(v: &'a Value) -> Self {
-        Cell::new(a.data.as_str())
-    }
-}
-
-impl<'a> From<&'a Message> for Row<'a> {
-    fn from(msg: &'a Message) -> Self {
-        let mut v = msg.values.iter().rev().fuse();
-        let row = Row::new(vec![
-            msg.id.as_str(),
-            v.next().unwrap_or_default(),
-            v.next().unwrap_or_default(),
-        ]);
-        if msg.ignored {
-            row.dark_gray().crossed_out()
-        } else {
-            row
         }
     }
 }
@@ -122,7 +121,7 @@ fn main() -> Result<()> {
     loop {
         if state.selected().is_none() {
             for m in rx.try_iter() {
-                match msgs.iter_mut().find(|ref existing| existing.id == m.id) {
+                match msgs.iter_mut().find(|existing| existing.id == m.id) {
                     Some(existing) => existing.merge(m),
                     None => msgs.push(m.into()),
                 }
@@ -139,7 +138,11 @@ fn main() -> Result<()> {
             } else if a.pinned && !b.pinned {
                 Ordering::Less
             } else {
-                a.values.last().unwrap().ts.cmp(&b.values.last().unwrap().ts)
+                a.values
+                    .last()
+                    .unwrap()
+                    .ts
+                    .cmp(&b.values.last().unwrap().ts)
             }
         });
 
@@ -149,15 +152,14 @@ fn main() -> Result<()> {
             } else {
                 Block::new().title("canalyzer | I)gnore; P)in to top; Exit F)iltering")
             }
-            .title_position(Position::Bottom).title_style(Style::new().yellow().on_blue());
+            .title_position(Position::Bottom)
+            .title_style(Style::new().yellow().on_blue());
+            let cols = f.size().width as usize / 17;
             f.render_stateful_widget(
                 Table::new(
-                    msgs.iter().map(|m| m.into()),
-                    &[
-                        Constraint::Length(6),
-                        Constraint::Percentage(50),
-                        Constraint::Percentage(50),
-                    ],
+                    msgs.iter().map(|m| m.as_row(cols)),
+                    iter::once(Constraint::Length(6))
+                        .chain(iter::repeat(Constraint::Length(16)).take(cols)),
                 )
                 .highlight_symbol(">")
                 .block(block),
@@ -201,7 +203,7 @@ fn main() -> Result<()> {
 
     std::io::stdout().execute(crossterm::terminal::LeaveAlternateScreen)?;
     crossterm::terminal::disable_raw_mode()?;
-    serde_json::to_writer(std::io::stdout(), &msgs);
+    let _ = serde_json::to_writer(std::io::stdout(), &msgs);
     println!();
     Ok(())
 }
